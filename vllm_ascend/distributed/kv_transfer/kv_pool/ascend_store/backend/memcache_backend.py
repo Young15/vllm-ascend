@@ -40,6 +40,10 @@ MEMCACHE_THREAD_START_WAIT_S = 0.1
 MEMCACHE_SSD_MEDIA_TYPE = 2
 
 
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
+
+
 def _validate_device_ub_qos() -> None:
     """Validate MF_DEVICE_UB_QOS used by the MemCache store transfers.
 
@@ -315,7 +319,12 @@ class MemcacheBackend(Backend):
             )
             return [0] * len(keys)
         assert self.store is not None
-        return self.store.batch_is_exist(keys)
+        start_time = time.perf_counter()
+        try:
+            return self.store.batch_is_exist(keys)
+        finally:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.info("Memcache exists took %.3f ms, keys=%d", elapsed_ms, len(keys))
 
     def batch_get_key_info(self, keys: list[str], *, for_load: bool = False) -> list[Any]:
         if self._lazy_init and not self._store_initialized:
@@ -464,7 +473,12 @@ class MemcacheBackend(Backend):
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -497,7 +511,12 @@ class MemcacheBackend(Backend):
         self.ensure_initialized()
         assert self.store is not None
         try:
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:

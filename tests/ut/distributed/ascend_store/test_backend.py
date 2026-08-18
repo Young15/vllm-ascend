@@ -546,8 +546,15 @@ class TestMooncakeBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1, 0]
-        result = b.exists(["k1", "k2"])
+        module_path = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend"
+        with (
+            patch(f"{module_path}.time.perf_counter", side_effect=[10.0, 10.012]),
+            patch(f"{module_path}.logger") as mock_logger,
+        ):
+            result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
+        b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Mooncake exists took 12.000 ms, keys=2")
 
     def test_batch_is_readable_uses_committed_object_state(self):
         b = self._make_backend()
@@ -962,9 +969,19 @@ class TestYuanrongBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1, 0]
-        result = b.exists(["k1", "k2"])
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.time.perf_counter",
+                side_effect=[10.0, 10.012],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
+            ) as mock_logger,
+        ):
+            result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
         b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Yuanrong exists took 12.000 ms, keys=2")
 
     def test_exists_exception(self):
         b = self._make_backend()
@@ -1387,7 +1404,15 @@ class TestMemcacheBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1]
-        self.assertEqual(b.exists(["k1"]), [1])
+        module_path = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend"
+        with (
+            patch(f"{module_path}.time.perf_counter", side_effect=[10.0, 10.012]),
+            patch(f"{module_path}.logger") as mock_logger,
+        ):
+            result = b.exists(["k1"])
+        self.assertEqual(result, [1])
+        b.store.batch_is_exist.assert_called_once_with(["k1"])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Memcache exists took 12.000 ms, keys=1")
 
     def test_batch_is_readable_uses_valid_gva_metadata(self):
         b = self._make_backend()
@@ -1666,6 +1691,95 @@ class TestMemcacheQosValidation(unittest.TestCase):
     def test_init_rejects_invalid_qos(self):
         with patch.dict(os.environ, {self._ENV: "7"}), self.assertRaisesRegex(ValueError, r"\[0, 4\]"):
             MemcacheBackend(MagicMock())
+
+
+class TestBackendLatencyStats(unittest.TestCase):
+    def _backends(self):
+        return (
+            (
+                "Mooncake",
+                TestMooncakeBackendMethods()._make_backend(),
+                "batch_get_into_multi_buffers",
+                "batch_put_from_multi_buffers",
+            ),
+            (
+                "Yuanrong",
+                TestYuanrongBackendMethods()._make_backend(),
+                "mget_h2d_from_multi_buffers",
+                "mset_d2h_from_multi_buffers",
+            ),
+            (
+                "Memcache",
+                TestMemcacheBackendMethods()._make_backend(),
+                "batch_get_into_layers",
+                "batch_put_from_layers",
+            ),
+        )
+
+    def test_transfer_timing_preserves_results_and_errors(self):
+        keys, addrs, sizes = ["k1", "k2"], [[100, 200], [300]], [[10, 20], [30]]
+        for name, backend, get_method, put_method in self._backends():
+            module_path = f"vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.{name.lower()}_backend"
+            for operation, method, log_op in (("get", get_method, "load_kvc"), ("put", put_method, "store_kvc")):
+                for outcome in ("success", "partial_failure", "exception"):
+                    with self.subTest(backend=name, operation=operation, outcome=outcome):
+                        backend.store.reset_mock(return_value=True, side_effect=True)
+                        store_method = getattr(backend.store, method)
+                        if outcome == "exception":
+                            store_method.side_effect = RuntimeError("store unavailable")
+                        elif name == "Yuanrong":
+                            store_method.return_value = [] if outcome == "success" else ["k2"]
+                        else:
+                            store_method.return_value = [0, 0] if outcome == "success" else [0, -1]
+                        with (
+                            patch(f"{module_path}.time.perf_counter", side_effect=[10.0, 10.012]),
+                            patch(f"{module_path}.logger") as mock_logger,
+                        ):
+                            result = getattr(backend, operation)(keys, addrs, sizes)
+                        timing_logs = [
+                            _format_log_call(log) for log in mock_logger.info.call_args_list if "took" in log.args[0]
+                        ]
+                        self.assertEqual(timing_logs, [f"{name} {log_op} took 12.000 ms, bytes=60"])
+                        store_method.assert_called_once()
+                        self.assertEqual(store_method.call_args.args[:3], (keys, addrs, sizes))
+                        if operation == "put" or outcome == "exception":
+                            self.assertIsNone(result)
+                        elif outcome == "success":
+                            self.assertEqual(result, [0, 0])
+                        else:
+                            self.assertEqual(result, [0, 1] if name == "Yuanrong" else [0, -1])
+                        if outcome == "exception":
+                            self.assertIn("store unavailable", _format_log_call(mock_logger.error.call_args))
+
+    def test_exists_exception_still_logs_and_preserves_error_policy(self):
+        for name, backend, _, _ in self._backends():
+            with self.subTest(backend=name):
+                backend.store.batch_is_exist.side_effect = RuntimeError("store unavailable")
+                module_path = f"vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.{name.lower()}_backend"
+                with (
+                    patch(f"{module_path}.time.perf_counter", side_effect=[10.0, 10.012]),
+                    patch(f"{module_path}.logger") as mock_logger,
+                ):
+                    if name == "Yuanrong":
+                        self.assertEqual(backend.exists(["k1", "k2"]), [0, 0])
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "store unavailable"):
+                            backend.exists(["k1", "k2"])
+                self.assertEqual(_format_log_call(mock_logger.info.call_args), f"{name} exists took 12.000 ms, keys=2")
+
+    def test_lazy_uninitialized_reads_do_not_log_a_store_call(self):
+        for name, backend, _, _ in self._backends():
+            if name == "Yuanrong":
+                continue
+            with self.subTest(backend=name):
+                backend._lazy_init = True
+                backend._store_initialized = False
+                module_path = f"vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.{name.lower()}_backend"
+                with patch(f"{module_path}.logger") as mock_logger:
+                    self.assertEqual(backend.exists(["k1"]), [0])
+                    self.assertIsNone(backend.get(["k1"], [[100]], [[10]]))
+                mock_logger.info.assert_not_called()
+                self.assertEqual(backend.store.mock_calls, [])
 
 
 if __name__ == "__main__":
