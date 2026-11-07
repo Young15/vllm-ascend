@@ -102,6 +102,7 @@ class YuanrongBackend(Backend):
         )
         self._registered_buffers: tuple[list[int], list[int]] | None = None
         self._buffers_registered = False
+        self.put_calls = 0
 
     def set_device(self):
         local_rank = get_world_group().local_rank
@@ -164,7 +165,25 @@ class YuanrongBackend(Backend):
             logger.debug("Failed to get key details. keys=%s", failed_keys_for_log)
             return None
 
+    def get_host_buffers(self, keys: list[str]):
+        """Return SDK-owned Host buffers; callers must retain owners while reading."""
+        if not keys:
+            return []
+        get_buffers = getattr(self.store, "get_buffers", None)
+        if not callable(get_buffers):
+            raise RuntimeError("Yuanrong Host KV requires HeteroClient.get_buffers; upgrade the Datasystem SDK")
+        buffers = get_buffers(keys, self.config.get_sub_timeout_ms)
+        if len(buffers) != len(keys):
+            raise RuntimeError("Yuanrong Host Get returned a misaligned batch")
+        return buffers
+
+    def put_host_cache_objects(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        """Publish immutable prompt objects, propagating failures before PD readiness."""
+        self.put_calls += 1
+        self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        self.put_calls += 1
         assert self.store is not None
         failed_keys_for_log = keys
         try:

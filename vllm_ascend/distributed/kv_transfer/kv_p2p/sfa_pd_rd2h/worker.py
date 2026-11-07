@@ -249,6 +249,8 @@ class SFAPDRD2HConsumerWorker:
                 self.request_map[ext_id] = req_id
                 main_ids = list(getattr(req, "main_block_ids", []) or [])
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
+                if getattr(getattr(self, "offload_manager", None), "host_kv_runtime", None) is not None:
+                    self.offload_manager.host_kv_runtime.register_request(req_id, ext_id)
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
                 descriptor = getattr(req, "dspark_context_descriptor", None)
@@ -305,6 +307,10 @@ class SFAPDRD2HConsumerWorker:
                 receiver.discard_request_id(ext_id)
                 self._dspark_pending_recv.discard(req_id)
                 self._deferred_finished_req_ids.discard(req_id)
+            if getattr(getattr(self, "offload_manager", None), "host_kv_runtime", None) is not None:
+                runtime = self.offload_manager.host_kv_runtime
+                runtime.discard_request(req_id, ext_id)
+                logger.info("Yuanrong Host KV cumulative Decode stats: %s", runtime.snapshot_stats())
             self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
@@ -375,6 +381,9 @@ class SFAPDRD2HConsumerWorker:
                     # Waiting for finished_req_ids lets the next load hook run
                     # before cleanup and overflow an otherwise bounded pool.
                     receiver.retire_ready_request(ext_id, descriptor.generation)
+        if getattr(getattr(self, "offload_manager", None), "host_kv_runtime", None) is not None and failed_on_any:
+            self.offload_manager.host_kv_runtime.failed = True
+            raise RuntimeError("Yuanrong prompt publication or Indexer transfer failed; refusing local recomputation")
         if receiver is not None and failed_on_any:
             raise RuntimeError(f"DSpark remote prompt transfer failed; refusing local recomputation: {failed_on_any}")
         self._terminal_ext_ids.difference_update(finished_on_all)
@@ -454,9 +463,14 @@ class SFAPDRD2HConsumerWorker:
             topk_v_bases=self._topk_v_bases,
             topk_row_tokens=self._topk_row_tokens,
             topk_hot_tokens=self._topk_hot_tokens,
-            block_size=self._copy_sfa_block_size,
+            block_size=(
+                self.offload_manager.block_size
+                if getattr(self.offload_manager, "host_kv_runtime", None) is not None
+                else self._copy_sfa_block_size
+            ),
             dspark_draft_kv_metadata=self.dspark_draft_kv_metadata,
             dspark_draft_blocks_by_req=self._dspark_draft_blocks_by_req,
+            host_kv_runtime=getattr(self.offload_manager, "host_kv_runtime", None),
         )
 
     def _register_memfabric_pull(
@@ -488,7 +502,9 @@ class SFAPDRD2HConsumerWorker:
         self._main_block_lens = self.offload_manager.cpu_block_lens
         if len(self._main_block_lens) != len(main_names):
             raise RuntimeError("SparseKVOffloadManager shared CPU block-size/layer count mismatch")
-        if self.tp_rank == 0:
+        if getattr(getattr(self, "offload_manager", None), "host_kv_runtime", None) is not None:
+            self._cpu_pools = [None] * len(main_names)
+        elif self.tp_rank == 0:
             if len(k_caches_cpu) != len(main_names) or len(v_caches_cpu) != len(main_names):
                 raise RuntimeError("SparseKVOffloadManager CPU pool/layer count mismatch")
             self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
@@ -641,6 +657,22 @@ class SFAPDRD2HProducerWorker:
         self.block_size = [spec.block_size for spec in self.kv_cache_specs]
         self.num_kv_cache_groups = len(self.kv_cache_specs)
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config)
+        self._host_publisher = None
+        self._host_main_tensors = {}
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        if extra.get("history_source") == "yuanrong_host_cache":
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
+                YuanrongBackend,
+            )
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.host_kv_publisher import HostKVPublisher
+
+            self._host_publisher = HostKVPublisher(
+                YuanrongBackend(vllm_config.parallel_config),
+                extra.get("host_kv_namespace", ""),
+                engine_id,
+                self.main_group_idx,
+                self.block_size[self.main_group_idx],
+            )
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.stage_layer_names: list[str] = []
@@ -772,6 +804,8 @@ class SFAPDRD2HProducerWorker:
             layer_storage_slots=self.layer_storage_slots,
             producer_pp_rank=self.pp_rank,
             producer_pp_size=self.pp_size,
+            host_publisher=getattr(self, "_host_publisher", None),
+            main_tensors=getattr(self, "_host_main_tensors", {}),
         )
 
     @staticmethod
@@ -843,6 +877,8 @@ class SFAPDRD2HProducerWorker:
                 )
                 layer_meta.has_indexer = True
             self.layer_metadata[main_name] = layer_meta
+            if getattr(self, "_host_publisher", None) is not None:
+                self._host_main_tensors[main_name] = target_caches[main_name]
 
         self.last_layer_idx = max(main_by_layer)
         self.total_layers = self.last_layer_idx + 1
