@@ -1690,6 +1690,11 @@ class SparseKVOffloadConfig:
     Configuration for the Sparse KV cache offloading.
     """
 
+    # Yuanrong mode replaces dense Host main KV with owned block objects.
+    history_source: str = "dram"
+    host_cache_capacity_bytes: int = 8 << 30
+    host_cache_max_object_bytes: int = 64 << 20
+    host_cache_verify_h2d: bool = False
     enabled: bool = False
     topk_buffer_size: int = 4096
     dram_size_per_dp_GB: int = 128
@@ -1701,11 +1706,23 @@ class SparseKVOffloadConfig:
     fused_op_type: str = "none"
 
     @property
+    def uses_yuanrong_host_cache(self) -> bool:
+        return self.history_source == "yuanrong_host_cache"
+
+    @property
     def use_fused_copy_sfa(self) -> bool:
         return self.fused_op_type == "fused_copy_sfa"
 
     @model_validator(mode="after")
     def _validate_values(self):
+        if self.history_source not in ("dram", "yuanrong_host_cache"):
+            raise ValueError("sparse KV history_source must be dram or yuanrong_host_cache")
+        if self.host_cache_capacity_bytes <= 0 or self.host_cache_max_object_bytes <= 0:
+            raise ValueError("Host KV capacity and maximum object bytes must be positive")
+        if self.uses_yuanrong_host_cache and (
+            self.use_fused_overlap or self.use_fused_copy_sfa or self.keep_device_kv_cache
+        ):
+            raise ValueError("Yuanrong Host KV uses the ordinary resident sparse_copy path")
         if self.fused_op_type not in ("none", "fused_copy_sfa"):
             raise ValueError("sparse_kv_offload_config.fused_op_type must be none or fused_copy_sfa")
         if self.use_fused_copy_sfa and self.use_fused_overlap:
@@ -1729,6 +1746,29 @@ class SparseKVOffloadConfig:
     def _validate_preconditions(self, vllm_config: VllmConfig) -> None:
         if not self.enabled:
             return
+
+        if self.uses_yuanrong_host_cache:
+            transfer = vllm_config.kv_transfer_config
+            extra = transfer.kv_connector_extra_config if transfer is not None else {}
+            if (
+                transfer is None
+                or transfer.kv_connector != "SfaRemoteD2HConnector"
+                or extra.get("history_source") != self.history_source
+                or not extra.get("host_kv_namespace")
+            ):
+                raise ValueError(
+                    "Yuanrong Host KV requires SfaRemoteD2HConnector with matching history_source and host_kv_namespace"
+                )
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError(
+                    "Yuanrong Host KV graph execution has not been integrated; eager is currently required"
+                )
+            if vllm_config.speculative_config is not None:
+                raise ValueError("Yuanrong Host KV speculative token lifetime has not been integrated")
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "Yuanrong Host KV requires Decode prefix caching disabled until cross-request handoff is integrated"
+                )
 
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
             raise ValueError("Sparse KV offload don't support compress now.")

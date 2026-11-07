@@ -64,6 +64,7 @@ class ConsumerReadState:
     topk_row_tokens: int = 0
     topk_hot_tokens: int = 0
     block_size: int = 128
+    host_kv_runtime: Any | None = None
     dspark_context_receiver: DSparkContextReceiver | None = None
     dspark_draft_kv_metadata: dict[str, DraftKVCacheMetadata] = field(default_factory=dict)
     dspark_draft_blocks_by_req: dict[str, dict[int, tuple[int, ...]]] = field(default_factory=dict)
@@ -221,6 +222,9 @@ class MembPullReadThread(threading.Thread):
                         if not isinstance(p_session, str):
                             raise ValueError("MF_META session must be a string")
                         p_layer_meta = msgspec.msgpack.decode(msg[2])
+                        expected_source = "yuanrong_host_cache" if self._state.host_kv_runtime is not None else "dram"
+                        if any(meta.get("history_source", "dram") != expected_source for meta in p_layer_meta.values()):
+                            raise ValueError("P/D history_source mismatch; refusing full main-KV fallback")
                         unknown_layers = set(p_layer_meta) - set(self._state.layer_metadata)
                         if unknown_layers:
                             raise ValueError(f"MF_META contains layers unknown to D: {sorted(unknown_layers)}")
@@ -255,7 +259,10 @@ class MembPullReadThread(threading.Thread):
                         if len(msg) == 3:
                             sock.send_multipart((identity, b"", b"ACK"))
                         else:
-                            sock.send_multipart((identity, b"", encoder.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION))))
+                            ack = (MF_META_ACK, SFAPD_PROTOCOL_VERSION)
+                            if self._state.host_kv_runtime is not None:
+                                ack += ("yuanrong_host_cache",)
+                            sock.send_multipart((identity, b"", encoder.encode(ack)))
 
                     elif msg_type == DSPARK_DRAFT_KV:
                         self._handle_dspark_draft_kv(identity, msg, sock, encoder)
@@ -302,6 +309,21 @@ class MembPullReadThread(threading.Thread):
                                 raise RuntimeError(
                                     "MF_META was not received from this P connection before READ_READY_BATCH"
                                 )
+                            if self._state.host_kv_runtime is not None and group_member_idx == 0:
+                                for entry in msg[3]:
+                                    self._wait_for_dest_blocks(entry[0], layer_name)
+                                    objects = entry[5] if len(entry) > 5 else None
+                                    if entry[1] and not objects:
+                                        raise ValueError("Yuanrong prompt object metadata is missing")
+                                    if objects:
+                                        offload_id = self._state.get_offload_layer_id(layer_name)
+                                        row_bytes = tuple(
+                                            size // self._state.block_size
+                                            for size in self._state.main_block_lens[offload_id]
+                                        )
+                                        self._state.host_kv_runtime.register_objects(
+                                            entry[0], layer_name, objects, row_bytes
+                                        )
                             if read_reqs:
                                 self._do_read_batch(
                                     layer_name,
@@ -553,6 +575,8 @@ class MembPullReadThread(threading.Thread):
             raise RuntimeError(
                 f"MembPull main KV layout mismatch for {layer_name}: P=({p_k_len}, {p_v_len}), D=({d_k_len}, {d_v_len})"
             )
+        if state.host_kv_runtime is not None:
+            k_cpu_ptr = v_cpu_ptr = None
         d_indexer = state.indexer_tensors[pool_idx]
         if p_has_indexer != (d_indexer is not None):
             raise RuntimeError(

@@ -467,3 +467,92 @@ For multi-node deployment, advertise reachable addresses instead of
 - Layerwise buffer reuse cannot currently be combined with
   `MooncakeLayerwiseConnector` because per-buffer transfer completion gating is
   not yet implemented. Support is planned in a follow-up update.
+
+### Experimental Yuanrong Host object cache (V2)
+
+The optional `yuanrong_host_cache` source stores immutable prompt block objects in
+Yuanrong. Decode calls `HeteroClient.get_buffers`, makes an independent Host copy,
+and caches that copy by store key. HBM misses resolve the layer/component and token
+byte offsets in the cached object, then use the existing resident LRU and
+`memfabric_hybrid.offload.sparse_copy` path. Indexer/scale tensors still arrive through
+the `SfaRemoteD2HConnector` transport and remain in HBM.
+
+This source requires the Datasystem SDK with `HeteroClient.get_buffers` and
+`SDKHostBuffer.copy_into`. Both Prefill and Decode need the existing `YR_CONFIG_PATH`
+configuration. The prototype publishes separate per-layer block objects, including
+valid partial prompt blocks. Its private object keys include the producer generation,
+request identity, model/layout namespace, layer and logical token range. These objects
+are not interchangeable with an arbitrary existing AscendStore object's layout.
+
+Set the following connector extra configuration on **both** instances, in addition to
+the existing `SfaRemoteD2HConnector` P/D configuration:
+
+```json
+{
+  "transfer_backend": "memfabric",
+  "history_source": "yuanrong_host_cache",
+  "host_kv_namespace": "<same-immutable-model-and-weights-revision-on-P-and-D>"
+}
+```
+
+On Decode, also set the following `additional_config` entry:
+
+```json
+{
+  "sparse_kv_offload_config": {
+    "enabled": true,
+    "history_source": "yuanrong_host_cache",
+    "host_cache_capacity_bytes": 34359738368,
+    "host_cache_max_object_bytes": 67108864,
+    "host_cache_verify_h2d": true,
+    "fused_op_type": "none",
+    "use_fused_overlap": false
+  }
+}
+```
+
+`host_cache_capacity_bytes` is the total main-KV Host arena budget per DP instance,
+divided across TP ranks and rounded down to whole GiB per rank, matching the
+MemFabric allocator granularity. Every TP rank must receive at least 1 GiB. It must fit the existing `dram_size_per_dp_GB`
+limit. A cache miss admits one entire object, copies and validates it before making
+it visible. Budget exhaustion, missing objects, wrong identities or bad offsets fail
+the request; they do not fall back to a full main-KV pull. There is no active eviction
+or retry after partial HBM/LRU changes. Request completion removes its Host entries.
+The producer uses the existing evictable Yuanrong storage policy; this cache does not
+promise remote retention across an entire generation.
+
+`host_cache_verify_h2d=true` gathers each loaded hot row back to CPU and compares
+its bytes with the pinned Host source before attention. Use it for correctness
+acceptance; it adds D2H work and is disabled by default. A mismatch stops execution.
+The verification counter is required by the example validation script.
+
+The implementation currently checks for eager execution, ordinary sparse copy,
+BF16 SFA main KV, no speculative decoding, and the base connector's supported
+parallel layouts. Graph/fused/speculative integration and actual NPU acceptance are
+not established by CPU tests. Choose and verify a real deployment configuration
+before relying on this source. Decode prefix-cache reuse across requests requires
+additional object-identity handoff; set `--no-enable-prefix-caching` on Decode for this adapter.
+
+Generated token KV is available for its current forward, is not written to Yuanrong
+or the old full Host KV pool, and is excluded from later selections after that forward.
+This changes generation semantics and is intended for the requested integration probe,
+not equivalent unrestricted generation. Prefill publication hashes the original tensor
+bytes and reads the published object's actual size; Decode validates the copied
+payload before resolving addresses. Those additional checks favor correctness over
+performance.
+
+For a real P/D check, start a fresh idle Decode instance and the existing layerwise PD
+proxy, then run:
+
+```bash
+python examples/disaggregated_prefill_v1/validate_yuanrong_host_kv.py \
+  --proxy-url http://<proxy-host>:<proxy-port> \
+  --model <served-model-name> --prompt-file <prompt-file> \
+  --decode-log <decode-log-file> --report <report-file>
+```
+
+The check requires an actual completion plus Decode counters proving Get, owned Host
+copy, Host reuse, Host-to-HBM copying and request cleanup. It does not certify numerical
+attention equivalence, NPU memory registration, throughput, or all parallel settings.
+To revert, disable the new source on both P and D and restart them; the default `dram`
+path and HBM attention implementation are unchanged.

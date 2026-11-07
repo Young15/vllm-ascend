@@ -273,6 +273,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             use_fused_overlap=False,
             use_fused_copy_sfa=False,
             dram_size_per_dp_GB=dram_size_per_dp_gb,
+            uses_yuanrong_host_cache=False,
         )
         return vllm_config, kv_cache_config, offload_config
 

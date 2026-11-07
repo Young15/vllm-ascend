@@ -1149,6 +1149,7 @@ def _allocate_kv_cache(
                     get_tensor_model_parallel_rank(),
                     get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache,
                     lambda size, align: _allocate_int8_cache_tensor(size, align, device),
+                    allocate_dense_host=not get_ascend_config().sparse_kv_offload_config.uses_yuanrong_host_cache,
                 )
         elif enable_sfa(vllm_config) and kv_cache_spec_uses_packed_sfa_main_cache(example_spec):
             k_size = kv_cache_tensor_size

@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -47,6 +47,8 @@ class ProducerSendState:
     layer_storage_slots: dict[int, tuple[int, ...]]
     producer_pp_rank: int = 0
     producer_pp_size: int = 1
+    host_publisher: Any | None = None
+    main_tensors: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -391,6 +393,17 @@ class MembPullSendingThread(threading.Thread):
             ext_id = get_external_request_id(req_id)
             has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
             chunk_done = layer_idx == self.last_layer_idx and rm.chunk_finish and has_endpoint
+            host_objects = None
+            if self._state.host_publisher is not None and has_endpoint and rm.group_member_idx == 0:
+                host_objects = self._state.host_publisher.publish(
+                    ext_id,
+                    layer_name,
+                    p_main_block_ids,
+                    main_start_block,
+                    min(rm.local_computed_tokens, rm.prompt_len),
+                    self._state.main_tensors[layer_name],
+                    layer_meta,
+                )
             if (p_main_block_ids or p_indexer_block_ids or chunk_done) and has_endpoint:
                 assert rm.remote_host is not None
                 assert rm.remote_port is not None
@@ -400,15 +413,10 @@ class MembPullSendingThread(threading.Thread):
                 endpoint_engine_ids[endpoint] = rm.remote_engine_id
                 read_reqs, done_ext_ids = endpoint_payloads.setdefault(endpoint, ([], []))
                 if p_main_block_ids or p_indexer_block_ids:
-                    read_reqs.append(
-                        (
-                            ext_id,
-                            p_main_block_ids,
-                            p_indexer_block_ids,
-                            main_start_block,
-                            indexer_start_block,
-                        )
-                    )
+                    entry = (ext_id, p_main_block_ids, p_indexer_block_ids, main_start_block, indexer_start_block)
+                    if self._state.host_publisher is not None:
+                        entry += (host_objects,)
+                    read_reqs.append(entry)
                 if chunk_done:
                     done_ext_ids.append(ext_id)
             logger.debug(
@@ -471,6 +479,7 @@ class MembPullSendingThread(threading.Thread):
                 "tensor_group_idx": list(meta.tensor_group_idx),
                 "main_tensor_count": meta.main_tensor_count,
                 "has_indexer": meta.has_indexer,
+                "history_source": "yuanrong_host_cache" if self._state.host_publisher is not None else "dram",
             }
         dealer.send(
             encoder.encode(
@@ -488,11 +497,14 @@ class MembPullSendingThread(threading.Thread):
             frames = dealer.recv_multipart()
             payload = [f for f in frames if f != b""]
             if payload == [b"ACK"]:
-                if self._state.producer_pp_size > 1:
+                if self._state.producer_pp_size > 1 or self._state.host_publisher is not None:
                     raise RuntimeError("SFAPD producer PP>1 requires a PP-aware D; received a legacy MF_META ACK")
             elif len(payload) == 1:
                 reply = msgspec.msgpack.Decoder(type=tuple).decode(payload[0])
-                if reply != (MF_META_ACK, SFAPD_PROTOCOL_VERSION):
+                expected = (MF_META_ACK, SFAPD_PROTOCOL_VERSION)
+                if self._state.host_publisher is not None:
+                    expected += ("yuanrong_host_cache",)
+                if reply != expected:
                     raise RuntimeError(f"MembPull P MF_META got unexpected reply: {reply!r}")
             else:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")

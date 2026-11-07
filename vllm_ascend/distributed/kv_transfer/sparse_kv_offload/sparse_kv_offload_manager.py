@@ -181,6 +181,7 @@ def allocate_kv_offload_topk_profile_buffers(
 
 
 _CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
+_HOST_KV_ARENA_ALIGNMENT = 1 << 30
 # Worst-case 2 MiB-alignment waste per host layer (see empty_aligned_int8_cpu_tensors):
 # 1x for rounding the raw buffer base address up to the alignment boundary, plus 1x tail
 # padding for each of the two aligned tensors (k_cache_cpu, v_cache_cpu) whose sizes are
@@ -282,12 +283,18 @@ def plan_sparse_kv_offload_memory(
     )
     workload_limit_blocks = max_blocks_per_request * vllm_config.scheduler_config.max_num_seqs + _VLLM_NULL_BLOCK_COUNT
 
+    source_config = (getattr(vllm_config, "additional_config", None) or {}).get("sparse_kv_offload_config", {})
+    yuanrong_history = source_config.get("history_source") == "yuanrong_host_cache"
+    if yuanrong_history:
+        # Logical block count is no longer backed by one full Host row per token.
+        dram_limit_blocks = workload_limit_blocks
+        host_alignment_reserve_bytes = 0
     limits = {
         "npu": npu_limit_blocks,
         "dram": dram_limit_blocks,
         "workload": workload_limit_blocks,
     }
-    if dram_limit_blocks < npu_limit_blocks:
+    if not yuanrong_history and dram_limit_blocks < npu_limit_blocks:
         logger.warning_once(
             "Sparse KV offload: host DRAM budget allows only %d KV blocks while NPU "
             "memory could hold %d, so batch size / max_model_len capacity is limited "
@@ -301,7 +308,11 @@ def plan_sparse_kv_offload_memory(
     limiting_factor = min(limits, key=lambda name: limits[name])
     final_num_blocks = limits[limiting_factor]
     final_planner_bytes = final_num_blocks * total_page_size_bytes
-    planned_host_bytes = final_num_blocks * host_page_size_bytes
+    planned_host_bytes = (
+        source_config.get("host_cache_capacity_bytes", 8 << 30)
+        if yuanrong_history
+        else final_num_blocks * host_page_size_bytes
+    )
     planned_device_bytes = final_num_blocks * npu_page_size_bytes
     return SparseKVOffloadMemoryBudget(
         npu_limit_blocks=npu_limit_blocks,
@@ -341,8 +352,9 @@ def allocate_kv_cache_tensors_for_sparse_kv_offload(
     tp_rank: int,
     keep_device_kv_cache: bool,
     npu_kv_cache_allocate_func: typing.Callable,
+    allocate_dense_host: bool = True,
 ):
-    if tp_rank == 0:
+    if tp_rank == 0 and allocate_dense_host:
         [k_tensor_cpu, v_tensor_cpu] = empty_aligned_int8_cpu_tensors(
             [k_tensor_size, v_tensor_size],
             alignment,
@@ -404,7 +416,7 @@ def reshape_kv_cache_tensors_for_sparse_kv_offload(
     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape) if raw_k_tensor is not None else None
     v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape) if raw_v_tensor is not None else None
 
-    if tp_rank == 0:
+    if raw_k_tensor_cpu is not None:
         k_cache_cpu = raw_k_tensor_cpu.view(k_cache_dtype).view(k_shape)
         v_cache_cpu = raw_v_tensor_cpu.view(v_cache_dtype).view(v_shape)
     else:
@@ -507,6 +519,8 @@ class SparseKVOffloadManager:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.sparse_kv_offload_config = sparse_kv_offload_config
+        self.host_kv_runtime = None
+        self.uses_yuanrong_host_cache = sparse_kv_offload_config.uses_yuanrong_host_cache
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -555,7 +569,11 @@ class SparseKVOffloadManager:
         _sparse_kv_ops()
 
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30))
-        planned_pool_size_bytes = get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
+        planned_pool_size_bytes = (
+            sparse_kv_offload_config.host_cache_capacity_bytes
+            if self.uses_yuanrong_host_cache
+            else get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
+        )
         if planned_pool_size_bytes > dram_limit_bytes:
             raise ValueError(
                 "Sparse KV offload planned CPU pool exceeds DRAM limit after "
@@ -575,7 +593,15 @@ class SparseKVOffloadManager:
         config = offload.OffloadConfig()
         config.device_id = torch_npu.npu.current_device()
         config.reserve_size = actual_pool_size_bytes
-        config.alloc_size = actual_pool_size_bytes if self.tp_rank == 0 else 0
+        # Yuanrong entries are rank-owned; divide the configured budget across TP.
+        if self.uses_yuanrong_host_cache:
+            actual_pool_size_bytes = (
+                actual_pool_size_bytes // self.tp_size // _HOST_KV_ARENA_ALIGNMENT * _HOST_KV_ARENA_ALIGNMENT
+            )
+            if actual_pool_size_bytes == 0:
+                raise ValueError("Host KV budget must provide at least 1 GiB per TP rank")
+            config.reserve_size = actual_pool_size_bytes
+        config.alloc_size = actual_pool_size_bytes if self.tp_rank == 0 or self.uses_yuanrong_host_cache else 0
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
         config.scene = offload.Scene.SHARED
@@ -583,6 +609,27 @@ class SparseKVOffloadManager:
         config.store_url = f"tcp://127.0.0.1:{store_port}"
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
+        if self.uses_yuanrong_host_cache:
+            # Lazy imports keep the SDK out of the default path.
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
+                YuanrongBackend,
+            )
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.host_kv_allocator import HostKVArena
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.host_kv_cache import HostKVCache
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.host_kv_runtime import HostKVRuntime
+
+            backend = YuanrongBackend(parallel_config)
+            arena = HostKVArena(offload.empty([actual_pool_size_bytes], dtype=torch.int8, pin_memory=True))
+            cache = HostKVCache(
+                backend,
+                arena.allocate,
+                actual_pool_size_bytes,
+                max_object_bytes=sparse_kv_offload_config.host_cache_max_object_bytes,
+            )
+            namespace = vllm_config.kv_transfer_config.kv_connector_extra_config["host_kv_namespace"]
+            self.host_kv_runtime = HostKVRuntime(
+                cache, namespace, verify_h2d=sparse_kv_offload_config.host_cache_verify_h2d
+            )
 
     def _warmup_external_lru_planner_threads(self) -> int:
         if not (self.use_fused_overlap and self.tp_rank == 0):
@@ -852,39 +899,46 @@ class SparseKVOffloadManager:
         self.gvas_k_bases: list[int] = []
         self.gvas_v_bases: list[int] = []
         self.cpu_block_lens: list[tuple[int, int]] = []
-        gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
-        gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
-        cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device="npu")
-        shape_k_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
-        shape_v_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
-        if self.tp_rank == 0:
+        if self.uses_yuanrong_host_cache:
+            self.gvas_k_bases = [0] * self.num_layers
+            self.gvas_v_bases = [0] * self.num_layers
+            self.cpu_block_lens = [
+                (self.block_size * self.token_size_bytes_k, self.block_size * self.token_size_bytes_v)
+            ] * self.num_layers
+        else:
+            gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
+            gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
+            cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device="npu")
+            shape_k_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
+            shape_v_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
+            if self.tp_rank == 0:
+                for layer_id in range(self.num_layers):
+                    k_cpu = self.k_caches_cpu[layer_id]
+                    v_cpu = self.v_caches_cpu[layer_id]
+                    gvas_k_tensor[layer_id] = k_cpu.data_ptr()
+                    gvas_v_tensor[layer_id] = v_cpu.data_ptr()
+                    cpu_block_lens_tensor[layer_id, 0] = (
+                        k_cpu.numel() * k_cpu.element_size() // self.kv_cache_config.num_blocks
+                    )
+                    cpu_block_lens_tensor[layer_id, 1] = (
+                        v_cpu.numel() * v_cpu.element_size() // self.kv_cache_config.num_blocks
+                    )
+                shape_k_tensor.copy_(torch.tensor(self.k_caches_cpu[0].shape, dtype=torch.int64, device="npu"))
+                shape_v_tensor.copy_(torch.tensor(self.v_caches_cpu[0].shape, dtype=torch.int64, device="npu"))
+            self.tp_group.broadcast(gvas_k_tensor, src=0)
+            self.tp_group.broadcast(gvas_v_tensor, src=0)
+            self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
+            self.tp_group.broadcast(shape_k_tensor, src=0)
+            self.tp_group.broadcast(shape_v_tensor, src=0)
             for layer_id in range(self.num_layers):
-                k_cpu = self.k_caches_cpu[layer_id]
-                v_cpu = self.v_caches_cpu[layer_id]
-                gvas_k_tensor[layer_id] = k_cpu.data_ptr()
-                gvas_v_tensor[layer_id] = v_cpu.data_ptr()
-                cpu_block_lens_tensor[layer_id, 0] = (
-                    k_cpu.numel() * k_cpu.element_size() // self.kv_cache_config.num_blocks
+                self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
+                self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
+                self.cpu_block_lens.append(
+                    (
+                        cpu_block_lens_tensor[layer_id, 0].item(),
+                        cpu_block_lens_tensor[layer_id, 1].item(),
+                    )
                 )
-                cpu_block_lens_tensor[layer_id, 1] = (
-                    v_cpu.numel() * v_cpu.element_size() // self.kv_cache_config.num_blocks
-                )
-            shape_k_tensor.copy_(torch.tensor(self.k_caches_cpu[0].shape, dtype=torch.int64, device="npu"))
-            shape_v_tensor.copy_(torch.tensor(self.v_caches_cpu[0].shape, dtype=torch.int64, device="npu"))
-        self.tp_group.broadcast(gvas_k_tensor, src=0)
-        self.tp_group.broadcast(gvas_v_tensor, src=0)
-        self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
-        self.tp_group.broadcast(shape_k_tensor, src=0)
-        self.tp_group.broadcast(shape_v_tensor, src=0)
-        for layer_id in range(self.num_layers):
-            self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
-            self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
-            self.cpu_block_lens.append(
-                (
-                    cpu_block_lens_tensor[layer_id, 0].item(),
-                    cpu_block_lens_tensor[layer_id, 1].item(),
-                )
-            )
 
         if (self.use_fused_overlap or self.use_fused_copy_sfa) and self.tp_rank != 0:
             cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
@@ -1228,6 +1282,11 @@ class SparseKVOffloadManager:
         has_prefill: bool = False,
         capturing: bool = False,
     ) -> None:
+        if self.host_kv_runtime is not None:
+            if has_prefill or capturing or k is None or v is None:
+                raise RuntimeError("Yuanrong Host KV requires real eager Decode input")
+            self.host_kv_runtime.remember_current(layer_name, k, v)
+            return
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
@@ -1367,6 +1426,10 @@ class SparseKVOffloadManager:
         capturing: bool = False,
         skip_topk: bool = False,
     ):
+        if self.host_kv_runtime is not None:
+            if capturing:
+                raise RuntimeError("Yuanrong Host KV cannot run inside a captured graph")
+            skip_topk = False
         layer_id = self._get_offload_layer_id(layer_name)
         if num_tokens > self.max_num_topk_rows:
             raise ValueError(
@@ -1456,25 +1519,59 @@ class SparseKVOffloadManager:
                     self._onload_topk_kv_cpu,
                     args,
                 )
+            elif self.host_kv_runtime is not None:
+                self._prepare_host_kv_onload(args, layer_name, num_tokens)
             else:
                 self._onload_topk_kv_cpu(args)
 
             self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.host_kv_runtime is None:
             # Make sure that tp0 d2h is finished before other tp's h2d.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
-        offload.sparse_copy(
-            self.gvas_buffer_npu,
-            self.addr_buffer_npu,
-            self.size_buffer_npu,
-            self.num_tokens_buffer_npu,
-            self.topk_buffers_k[0].device,
-        )
+        try:
+            result = offload.sparse_copy(
+                self.gvas_buffer_npu,
+                self.addr_buffer_npu,
+                self.size_buffer_npu,
+                self.num_tokens_buffer_npu,
+                self.topk_buffers_k[0].device,
+            )
+
+            if self.host_kv_runtime is not None:
+                if result not in (None, 0):
+                    raise RuntimeError(f"Host KV sparse_copy failed with result={result}")
+                torch_npu.npu.current_stream().synchronize()
+                self.host_kv_runtime.verify_loaded_rows()
+                self.host_kv_runtime.complete(layer_name)
+        except BaseException:
+            if self.host_kv_runtime is not None:
+                # Keep leases pinned if device completion could not be established.
+                self.host_kv_runtime.failed = True
+            raise
 
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
+
+    def _prepare_host_kv_onload(self, args, layer_name: str, num_tokens: int) -> None:
+        error = None
+        try:
+            self.host_kv_runtime.mask_unavailable_tail(self, layer_name, num_tokens)
+            self._onload_topk_kv_cpu(args)
+        except Exception as exc:
+            error = exc
+        status = torch.tensor([int(error is not None)], dtype=torch.int32)
+        try:
+            if self.tp_size > 1:
+                torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX, group=self.tp_group.cpu_group)
+            if int(status[0]):
+                raise RuntimeError(
+                    "Yuanrong Host KV preparation failed on a TP rank; attention must not run"
+                ) from error
+        except BaseException:
+            self.host_kv_runtime.failed = True
+            raise
 
     def prepare_fused_overlap_external_plan(
         self,
@@ -1759,6 +1856,15 @@ class SparseKVOffloadManager:
             self.lru_workspace_threads,
             self.lru_workspace_threads,
         )
+        if self.host_kv_runtime is not None:
+            try:
+                self.host_kv_runtime.build_descriptors(
+                    self, self.offload_layer_names[layer_id], miss_count, miss_tokens, miss_slots, num_reqs
+                )
+            except BaseException:
+                self.host_kv_runtime.failed = True
+                raise
+            return
         sparse_kv_ops.sparse_kv_compute_lru_resident_addrs(
             miss_count,
             miss_tokens,
